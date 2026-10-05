@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attendance</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0f6b57">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  :root { --bg:#f5f7f6; --ink:#16231f; --muted:#5d6b66; --brand:#0f6b57; --line:#d8e0dc; --bad:#b3261e; --card:#fff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:640px; margin:0 auto; padding:20px 16px 48px; }
+  h1 { font-size:1.35rem; margin:0; } h2 { font-size:1.05rem; margin:20px 0 8px; }
+  .bar { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:12px; overflow-x:auto; }
+  label { display:block; font-size:.9rem; color:var(--muted); margin:10px 0 4px; }
+  input, select, textarea { width:100%; padding:10px; border:1px solid var(--line); border-radius:6px; font:inherit; background:#fff; }
+  button { background:var(--brand); color:#fff; border:0; border-radius:6px; padding:11px 16px; font:inherit; cursor:pointer; margin-top:12px; }
+  button.ghost { background:none; color:var(--brand); border:1px solid var(--brand); margin:0; padding:6px 12px; }
+  button.tab { margin:0 6px 0 0; } button.tab.on { background:var(--ink); }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline:3px solid #7cc4b2; outline-offset:2px; }
+  table { width:100%; border-collapse:collapse; } td, th { text-align:left; padding:8px 6px 8px 0; border-bottom:1px solid var(--line); vertical-align:middle; }
+  .msg { margin-top:10px; font-weight:600; } .err { color:var(--bad); } .ok { color:var(--brand); } .muted { color:var(--muted); }
+  .hidden { display:none; } .photo { width:100%; max-height:280px; object-fit:cover; border-radius:6px; border:1px solid var(--line); margin-bottom:10px; }
+  .tabs { margin-bottom:12px; }
+</style>
+</head>
+<body>
+<main>
+  <div id="login">
+    <h1>Attendance</h1>
+    <p class="muted">Log in with the account your college gave you.</p>
+    <div class="card">
+      <label for="email">Email</label><input id="email" type="email" autocomplete="username">
+      <label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password">
+      <button id="loginBtn">Log in</button><div id="loginMsg" class="msg err"></div>
+    </div>
+  </div>
+  <div id="app" class="hidden">
+    <div class="bar"><div><h1 id="who"></h1><span id="role" class="muted"></span></div><div><button class="ghost" id="pwBtn">Password</button> <button class="ghost" id="logout">Log out</button></div></div>
+    <div id="view"></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let token = localStorage.getItem('token'), user = JSON.parse(localStorage.getItem('user') || 'null'), timer;
+
+async function api(path, body, blob) {
+  const r = await fetch('/api' + path, { method: body ? 'POST' : 'GET',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token }, body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401 && token) { localStorage.clear(); location.reload(); }
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Something went wrong');
+  return blob ? r.blob() : r.json();
+}
+const getPos = () => new Promise((ok, fail) => navigator.geolocation
+  ? navigator.geolocation.getCurrentPosition(p => ok({ lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy }),
+      () => fail(new Error('Allow location access to continue')), { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 })
+  : fail(new Error('This browser has no location support')));
+const msg = (el, text, ok) => { el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'err'); };
+const resize = file => new Promise((ok, fail) => {
+  const img = new Image(); img.onerror = () => fail(new Error('Could not read that photo'));
+  img.onload = () => { const k = Math.min(1, 1024 / Math.max(img.width, img.height)), c = document.createElement('canvas');
+    c.width = img.width * k; c.height = img.height * k; c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); ok(c.toDataURL('image/jpeg', .7)); };
+  img.src = URL.createObjectURL(file);
+});
+
+$('loginBtn').onclick = async () => {
+  try {
+    const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: $('email').value, password: $('pw').value }) });
+    const d = await r.json(); if (!r.ok) throw new Error(d.error);
+    token = d.token; user = d.user; localStorage.setItem('token', token); localStorage.setItem('user', JSON.stringify(user)); start();
+  } catch (e) { $('loginMsg').textContent = e.message; }
+};
+$('pw').onkeydown = e => { if (e.key === 'Enter') $('loginBtn').click(); };
+$('pwBtn').onclick = async () => { const o = prompt('Current password'); if (!o) return; const n = prompt('New password (6+ characters)'); if (!n) return;
+  try { await api('/me/password', { old_password: o, new_password: n }); alert('Password changed'); } catch (e) { alert(e.message); } };
+$('logout').onclick = () => { localStorage.clear(); location.reload(); };
+function start() {
+  if (!token || !user) return;
+  $('login').classList.add('hidden'); $('app').classList.remove('hidden');
+  $('who').textContent = user.name; $('role').textContent = user.role;
+  ({ teacher, student, principal })[user.role]();
+}
+
+// Class photo + attendance list, shared by teacher and principal
+async function sessionPanel(el, id, editable) {
+  el.innerHTML = `<img class="photo" alt="Class photo"><div class="list"></div>`;
+  api(`/sessions/${id}/photo`, null, true).then(b => el.querySelector('img').src = URL.createObjectURL(b)).catch(() => el.querySelector('img').remove());
+  const refresh = async () => {
+    const d = await api(`/sessions/${id}/attendance`), n = d.students.filter(s => s.marked_at).length;
+    el.querySelector('.list').innerHTML = `<p><strong>${esc(d.session.subject)}</strong>: ${n} of ${d.students.length} present</p><table>` + d.students.map(s => `
+      <tr><td>${esc(s.name)}</td><td class="${s.marked_at ? 'ok' : 'muted'}">${s.marked_at ? (s.method === 'manual' ? 'Present (by teacher)' : 'Present (' + Math.round(s.distance_m) + ' m)') : 'Absent'}</td>
+      ${editable ? `<td><button class="ghost" data-s="${s.id}" data-p="${s.marked_at ? 0 : 1}">${s.marked_at ? 'Mark absent' : 'Mark present'}</button></td>` : ''}</tr>`).join('') + '</table>';
+  };
+  el.onclick = async e => { const b = e.target.closest('button[data-s]'); if (!b) return;
+    await api(`/sessions/${id}/override`, { student_id: +b.dataset.s, present: b.dataset.p === '1' }); refresh(); };
+  await refresh(); return refresh;
+}
+
+// ---------- Teacher ----------
+async function teacher() {
+  const classes = await api('/classes'); let photo = null;
+  $('view').innerHTML = `
+    <div class="card"><button class="ghost" id="checkin">Mark my attendance</button><div id="ciMsg" class="msg"></div></div>
+    <div class="card" id="startCard">
+      <label for="cls">Class</label><select id="cls">${classes.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select>
+      <label for="subj">Subject</label><input id="subj" placeholder="e.g. Java">
+      <label for="mins">Open for (minutes)</label><input id="mins" type="number" value="10" min="1" max="60">
+      <label for="ph">Photo of the students in class</label><input id="ph" type="file" accept="image/*" capture="environment">
+      <img id="prev" class="photo hidden" alt="Class photo preview" style="margin-top:10px">
+      <button id="startBtn">Start attendance</button><div id="stMsg" class="msg"></div>
+    </div>
+    <div class="card hidden" id="liveCard"><div id="panel"></div><button id="closeBtn">Close session</button></div>`;
+  if (!classes.length) msg($('stMsg'), 'No classes yet. Ask the principal to add one.');
+  $('checkin').onclick = async () => {
+    try { await api('/teacher/checkin', await getPos()); msg($('ciMsg'), 'Your attendance is marked for today', true); } catch (e) { msg($('ciMsg'), e.message); }
+  };
+  $('ph').onchange = async e => {
+    try { photo = e.target.files[0] ? await resize(e.target.files[0]) : null; $('prev').src = photo || ''; $('prev').classList.toggle('hidden', !photo); }
+    catch (err) { msg($('stMsg'), err.message); }
+  };
+  $('startBtn').onclick = async () => {
+    try {
+      if (!photo) throw new Error('Take a photo of the students first');
+      msg($('stMsg'), 'Getting your location...', true);
+      const r = await api('/sessions/start', { ...(await getPos()), photo, class_id: +$('cls').value, subject: $('subj').value.trim(), minutes: +$('mins').value });
+      msg($('stMsg'), '', true); $('startCard').classList.add('hidden'); $('liveCard').classList.remove('hidden');
+      const refresh = await sessionPanel($('panel'), r.session_id, true);
+      timer = setInterval(refresh, 5000);
+      $('closeBtn').onclick = async () => { await api(`/sessions/${r.session_id}/close`, {}); clearInterval(timer); teacher(); };
+    } catch (e) { msg($('stMsg'), e.message); }
+  };
+}
+
+// ---------- Student ----------
+function student() {
+  $('view').innerHTML = `<div class="card"><div id="status" class="muted">Checking for an open session...</div>
+    <button id="markBtn" class="hidden">Mark my attendance</button><div id="mkMsg" class="msg"></div></div>
+    <h2>My attendance</h2><div class="card" id="stats"></div>`;
+  let sid = null;
+  const stats = async () => { const s = await api('/student/stats');
+    $('stats').innerHTML = s.length ? '<table>' + s.map(x => { const p = Math.round(100 * x.present / x.total);
+      return `<tr><td>${esc(x.subject)}</td><td class="${p < 75 ? 'err' : 'ok'}">${p}% (${x.present}/${x.total})</td></tr>`; }).join('') + '</table><p class="muted">Below 75% is shown in red.</p>' : '<span class="muted">No lectures recorded yet.</span>'; };
+  const poll = async () => {
+    const d = await api('/sessions/active'); sid = d.session && d.session.id;
+    $('status').textContent = !d.session ? 'No open session for your class right now.'
+      : d.already_marked ? `Attendance marked for ${d.session.subject}.` : `${d.session.subject} is open. Stay within the class area and tap below.`;
+    $('markBtn').classList.toggle('hidden', !d.session || d.already_marked);
+  };
+  poll(); stats(); timer = setInterval(poll, 5000);
+  $('markBtn').onclick = async () => {
+    try { msg($('mkMsg'), 'Getting your location...', true);
+      const r = await api('/attendance/mark', { ...(await getPos()), session_id: sid });
+      msg($('mkMsg'), `Marked present (${r.distance_m} m from teacher)`, true); poll(); stats();
+    } catch (e) { msg($('mkMsg'), e.message); }
+  };
+}
+
+// ---------- Principal ----------
+function principal() {
+  $('view').innerHTML = `<div class="tabs"><button class="tab" data-t="overview">Overview</button><button class="tab" data-t="sessions">Sessions</button><button class="tab" data-t="users">Users</button></div><div id="tab"></div>`;
+  const tabs = { overview, sessions, users };
+  document.querySelector('.tabs').onclick = e => { const t = e.target.dataset.t; if (!t) return;
+    clearInterval(timer); document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t)); tabs[t](); };
+  document.querySelector('.tab').click();
+}
+async function overview() {
+  const d = await api('/principal/summary');
+  $('tab').innerHTML = `<button class="ghost" id="exp">Download attendance report (CSV)</button><h2>Teachers today</h2><div class="card">${d.teachers.length ? '<table>' + d.teachers.map(t =>
+    `<tr><td>${esc(t.name)}</td><td class="${t.check_in ? 'ok' : 'err'}">${t.check_in ? 'Checked in ' + new Date(t.check_in).toLocaleTimeString() : 'Not checked in'}</td></tr>`).join('') + '</table>' : '<span class="muted">No teachers added yet.</span>'}</div>
+    <h2>Students</h2><div class="card">${d.students.length ? '<table><tr><th>Student</th><th>Class</th><th>Attendance</th></tr>' + d.students.map(s => { const p = s.total ? Math.round(100 * s.present / s.total) : null;
+      return `<tr><td>${esc(s.name)}</td><td>${esc(s.class)}</td><td class="${p !== null && p < 75 ? 'err' : ''}">${p === null ? 'No lectures yet' : p + '% (' + s.present + '/' + s.total + ')'}</td></tr>`; }).join('') + '</table><p class="muted">Below 75% is shown in red.</p>' : '<span class="muted">No students added yet.</span>'}</div>`;
+  $('exp').onclick = async () => { const b = await api('/principal/export', null, true), a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = 'attendance-report.csv'; a.click(); };
+}
+async function sessions() {
+  const list = await api('/principal/sessions');
+  $('tab').innerHTML = `<div class="card">${list.length ? '<table>' + list.map(s => `<tr><td>${new Date(s.start_time).toLocaleString()}<br><span class="muted">${esc(s.class)} · ${esc(s.teacher)}</span></td>
+    <td>${esc(s.subject)}<br><span class="muted">${s.present}/${s.total} present</span></td><td><button class="ghost" data-id="${s.id}">View</button></td></tr>`).join('') + '</table>' : '<span class="muted">No sessions yet.</span>'}</div><div class="card hidden" id="detail"></div>`;
+  $('tab').onclick = async e => { const b = e.target.closest('button[data-id]'); if (!b) return;
+    $('detail').classList.remove('hidden'); await sessionPanel($('detail'), +b.dataset.id, true); $('detail').scrollIntoView(); };
+}
+async function users() {
+  const [classes, list] = await Promise.all([api('/classes'), api('/users')]);
+  $('tab').innerHTML = `
+    <div class="card"><strong>Add a class</strong><label for="cn">Class name</label><input id="cn" placeholder="e.g. BSc.CA TY"><button id="addClass">Add class</button><div id="cMsg" class="msg"></div></div>
+    <div class="card"><strong>Add a user</strong>
+      <label for="un">Name</label><input id="un"><label for="ue">Email</label><input id="ue" type="email"><label for="up">Password (6+ characters)</label><input id="up">
+      <label for="ur">Role</label><select id="ur"><option value="student">Student</option><option value="teacher">Teacher</option><option value="principal">Principal</option></select>
+      <div id="clsWrap"><label for="uc">Class (for students)</label><select id="uc">${classes.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
+      <button id="addUser">Add user</button><div id="uMsg" class="msg"></div></div>
+    <div class="card"><strong>Add many users at once</strong>
+      <label for="br">Who</label><select id="br"><option value="student">Students</option><option value="teacher">Teachers</option></select>
+      <label for="bc">Class (for students)</label><select id="bc">${classes.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select>
+      <label for="bt">One per line: name, email, password (password is optional)</label><textarea id="bt" rows="5" placeholder="Riya Shah, riya@mail.com"></textarea>
+      <button id="bulk">Add all</button><div id="bMsg" class="msg"></div><pre id="bOut" style="white-space:pre-wrap"></pre></div>
+    <div class="card" id="ulist"><table>${list.map(u => `<tr><td>${esc(u.name)}<br><span class="muted">${esc(u.email)}</span></td><td>${esc(u.role)}${u.class ? '<br><span class="muted">' + esc(u.class) + '</span>' : ''}</td>
+      <td><button class="ghost" data-r="${u.id}">Reset password</button></td></tr>`).join('')}</table></div>`;
+  $('ulist').onclick = async e => { const b = e.target.closest('button[data-r]'); if (!b) return; const pw = prompt('New password for this user (6+ characters)'); if (!pw) return;
+    try { await api(`/users/${b.dataset.r}/password`, { password: pw }); alert('Password changed'); } catch (err) { alert(err.message); } };
+  $('bulk').onclick = async () => { try {
+    const r = await api('/users/bulk', { role: $('br').value, class_id: +$('bc').value, text: $('bt').value });
+    msg($('bMsg'), `${r.created.length} added, ${r.skipped.length} skipped`, true);
+    $('bOut').textContent = (r.created.length ? 'SAVE THESE LOGINS NOW (passwords are not shown again):\n' + r.created.map(c => `${c.name}, ${c.email}, ${c.password}`).join('\n') : '') + (r.skipped.length ? '\n\nSkipped:\n' + r.skipped.join('\n') : '');
+  } catch (e) { msg($('bMsg'), e.message); } };
+  $('ur').onchange = () => $('clsWrap').classList.toggle('hidden', $('ur').value !== 'student');
+  $('addClass').onclick = async () => { try { await api('/classes', { name: $('cn').value }); users(); } catch (e) { msg($('cMsg'), e.message); } };
+  $('addUser').onclick = async () => { try {
+    await api('/users', { name: $('un').value, email: $('ue').value, password: $('up').value, role: $('ur').value, class_id: +$('uc').value }); users();
+  } catch (e) { msg($('uMsg'), e.message); } };
+}
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+start();
+</script>
+</body>
+</html>
