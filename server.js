@@ -34,7 +34,11 @@ async function init() {
   CREATE TABLE IF NOT EXISTS teacher_attendance (
     id SERIAL PRIMARY KEY, teacher_id INTEGER, date TEXT, lat DOUBLE PRECISION, lon DOUBLE PRECISION,
     check_in BIGINT, UNIQUE (teacher_id, date));
-  CREATE INDEX IF NOT EXISTS idx_sessions_class ON sessions(class_id, status);`);
+  CREATE INDEX IF NOT EXISTS idx_sessions_class ON sessions(class_id, status);
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_phone TEXT;
+  ALTER TABLE attendance ADD COLUMN IF NOT EXISTS selfie BYTEA;
+  CREATE TABLE IF NOT EXISTS teacher_classes (teacher_id INTEGER, class_id INTEGER, PRIMARY KEY (teacher_id, class_id));
+  CREATE TABLE IF NOT EXISTS leaves (id SERIAL PRIMARY KEY, student_id INTEGER, from_date TEXT, to_date TEXT, reason TEXT, status TEXT DEFAULT 'pending', created_at BIGINT);`);
   if (!(await one('SELECT 1 AS x FROM users LIMIT 1'))) {
     const email = (process.env.ADMIN_EMAIL || 'admin@college.com').toLowerCase();
     const pw = process.env.ADMIN_PASSWORD || crypto.randomBytes(4).toString('hex');
@@ -51,6 +55,8 @@ function distanceM(lat1, lon1, lat2, lon2) { // Haversine
 const validGps = b => Number.isFinite(b.lat) && Number.isFinite(b.lon) && Number.isFinite(b.accuracy);
 const h = fn => (req, res, next) => fn(req, res).catch(next); // send async errors to the error handler
 const dup = e => e.code === '23505';
+const digits = s => (s || '').replace(/\D/g, '').slice(0, 15) || null;
+const isDate = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -93,7 +99,22 @@ app.post('/api/me/password', auth(), h(async (req, res) => {
   await q('UPDATE users SET password_hash=$1 WHERE id=$2', [bcrypt.hashSync(new_password, 10), u.id]);
   res.json({ ok: true });
 }));
-app.get('/api/classes', auth(), h(async (_, res) => res.json(await q('SELECT * FROM classes ORDER BY name'))));
+app.get('/api/classes', auth(), h(async (req, res) => res.json(req.user.role === 'teacher'
+  ? await q('SELECT c.* FROM classes c JOIN teacher_classes t ON t.class_id=c.id WHERE t.teacher_id=$1 ORDER BY c.name', [req.user.id])
+  : await q('SELECT * FROM classes ORDER BY name'))));
+app.get('/api/assignments', auth('principal'), h(async (_, res) => res.json(await q(
+  'SELECT t.teacher_id, t.class_id, u.name AS teacher, c.name AS class FROM teacher_classes t JOIN users u ON u.id=t.teacher_id JOIN classes c ON c.id=t.class_id ORDER BY u.name,c.name'))));
+app.post('/api/assignments', auth('principal'), h(async (req, res) => {
+  const { teacher_id, class_id } = req.body;
+  if (!(await one("SELECT 1 AS x FROM users WHERE id=$1 AND role='teacher'", [teacher_id])) || !(await one('SELECT 1 AS x FROM classes WHERE id=$1', [class_id])))
+    return res.status(400).json({ error: 'Choose a teacher and a class' });
+  await q('INSERT INTO teacher_classes(teacher_id,class_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [teacher_id, class_id]);
+  res.json({ ok: true });
+}));
+app.post('/api/assignments/remove', auth('principal'), h(async (req, res) => {
+  await q('DELETE FROM teacher_classes WHERE teacher_id=$1 AND class_id=$2', [+req.body.teacher_id, +req.body.class_id]);
+  res.json({ ok: true });
+}));
 
 // ---------- Principal ----------
 app.post('/api/classes', auth('principal'), h(async (req, res) => {
@@ -105,13 +126,13 @@ app.post('/api/classes', auth('principal'), h(async (req, res) => {
 app.get('/api/users', auth('principal'), h(async (_, res) => res.json(await q(
   'SELECT u.id,u.name,u.email,u.role,c.name AS class FROM users u LEFT JOIN classes c ON c.id=u.class_id ORDER BY u.role,u.name'))));
 app.post('/api/users', auth('principal'), h(async (req, res) => {
-  const { name, password, role, class_id } = req.body, email = (req.body.email || '').trim().toLowerCase();
+  const { name, password, role, class_id, parent_phone } = req.body, email = (req.body.email || '').trim().toLowerCase();
   if (!name || !email.includes('@') || (password || '').length < 6) return res.status(400).json({ error: 'Name, valid email and a password of 6+ characters are required' });
   if (!['student', 'teacher', 'principal'].includes(role)) return res.status(400).json({ error: 'Choose a role' });
   if (role === 'student' && !(await one('SELECT 1 AS x FROM classes WHERE id=$1', [class_id]))) return res.status(400).json({ error: 'Choose a class for the student' });
   try {
-    await q('INSERT INTO users(name,email,password_hash,role,class_id) VALUES ($1,$2,$3,$4,$5)',
-      [name.trim(), email, bcrypt.hashSync(password, 10), role, role === 'student' ? class_id : null]);
+    await q('INSERT INTO users(name,email,password_hash,role,class_id,parent_phone) VALUES ($1,$2,$3,$4,$5,$6)',
+      [name.trim(), email, bcrypt.hashSync(password, 10), role, role === 'student' ? class_id : null, role === 'student' ? digits(parent_phone) : null]);
     res.json({ ok: true });
   } catch (e) { if (!dup(e)) throw e; res.status(409).json({ error: 'That email is already registered' }); }
 }));
@@ -121,13 +142,13 @@ app.post('/api/users/bulk', auth('principal'), h(async (req, res) => { // lines:
   if (role === 'student' && !(await one('SELECT 1 AS x FROM classes WHERE id=$1', [class_id]))) return res.status(400).json({ error: 'Choose a class' });
   const created = [], skipped = [];
   for (const line of String(text || '').split('\n')) {
-    const [name, email, pw] = line.split(',').map(s => s.trim());
+    const [name, email, phone, pw] = line.split(',').map(s => s.trim());
     if (!name && !email) continue;
     if (!name || !(email || '').includes('@') || (pw && pw.length < 6)) { skipped.push(`${line.trim()} (needs name, email, optional 6+ char password)`); continue; }
     const password = pw || crypto.randomBytes(3).toString('hex');
     try {
-      await q('INSERT INTO users(name,email,password_hash,role,class_id) VALUES ($1,$2,$3,$4,$5)',
-        [name, email.toLowerCase(), bcrypt.hashSync(password, 10), role, role === 'student' ? class_id : null]);
+      await q('INSERT INTO users(name,email,password_hash,role,class_id,parent_phone) VALUES ($1,$2,$3,$4,$5,$6)',
+        [name, email.toLowerCase(), bcrypt.hashSync(password, 10), role, role === 'student' ? class_id : null, role === 'student' ? digits(phone) : null]);
       created.push({ name, email: email.toLowerCase(), password });
     } catch (e) { if (!dup(e)) throw e; skipped.push(`${email} (already registered)`); }
   }
@@ -146,6 +167,14 @@ app.get('/api/principal/summary', auth('principal'), h(async (_, res) => {
   const teachers = await q(`SELECT u.name, t.check_in FROM users u
     LEFT JOIN teacher_attendance t ON t.teacher_id=u.id AND t.date=$1 WHERE u.role='teacher' ORDER BY u.name`, [today()]);
   res.json({ students, teachers });
+}));
+app.get('/api/principal/defaulters', auth('principal'), h(async (req, res) => {
+  const min = Math.min(Math.max(+req.query.min || 75, 1), 100);
+  const rows = await q(`SELECT u.name, c.name AS class, u.parent_phone,
+    (SELECT COUNT(*) FROM sessions s WHERE s.class_id=u.class_id) AS total,
+    (SELECT COUNT(*) FROM attendance a WHERE a.student_id=u.id) AS present
+    FROM users u JOIN classes c ON c.id=u.class_id WHERE u.role='student' ORDER BY c.name,u.name`);
+  res.json(rows.filter(r => r.total > 0 && 100 * r.present / r.total < min));
 }));
 app.get('/api/principal/sessions', auth('principal'), h(async (_, res) => res.json(await q(`
   SELECT s.id, s.subject, s.start_time, c.name AS class, u.name AS teacher,
@@ -174,6 +203,8 @@ app.post('/api/sessions/start', auth('teacher'), h(async (req, res) => {
   const { class_id, subject, lat, lon, accuracy, photo, minutes = 10 } = req.body;
   if (!subject || !validGps(req.body) || !(await one('SELECT 1 AS x FROM classes WHERE id=$1', [class_id])))
     return res.status(400).json({ error: 'Class, subject and location are required' });
+  if (!(await one('SELECT 1 AS x FROM teacher_classes WHERE teacher_id=$1 AND class_id=$2', [req.user.id, class_id])))
+    return res.status(403).json({ error: 'You are not assigned to this class' });
   if (!/^data:image\/jpeg;base64,/.test(photo || '')) return res.status(400).json({ error: 'Take a photo of the class first' });
   if (accuracy > MAX_ACCURACY) return res.status(400).json({ error: `GPS is weak (±${Math.round(accuracy)} m). Move near a window and try again` });
   const img = Buffer.from(photo.split(',')[1], 'base64');
@@ -197,9 +228,17 @@ app.get('/api/sessions/:id/photo', auth('teacher', 'principal'), h(async (req, r
 }));
 app.get('/api/sessions/:id/attendance', auth('teacher', 'principal'), h(async (req, res) => {
   const s = await getSession(req, res); if (!s) return;
-  const students = await q(`SELECT u.id, u.name, a.distance_m, a.marked_at, a.method FROM users u
-    LEFT JOIN attendance a ON a.student_id=u.id AND a.session_id=$1 WHERE u.role='student' AND u.class_id=$2 ORDER BY u.name`, [s.id, s.class_id]);
+  const day = new Date(s.start_time).toLocaleDateString('en-CA', { timeZone: TZ });
+  const students = await q(`SELECT u.id, u.name, a.distance_m, a.marked_at, a.method, (a.selfie IS NOT NULL) AS has_selfie,
+    EXISTS (SELECT 1 FROM leaves l WHERE l.student_id=u.id AND l.status='approved' AND l.from_date<=$3 AND l.to_date>=$3) AS on_leave
+    FROM users u LEFT JOIN attendance a ON a.student_id=u.id AND a.session_id=$1 WHERE u.role='student' AND u.class_id=$2 ORDER BY u.name`, [s.id, s.class_id, day]);
   res.json({ session: s, students });
+}));
+app.get('/api/sessions/:id/selfie/:student', auth('teacher', 'principal'), h(async (req, res) => {
+  const s = await getSession(req, res); if (!s) return;
+  const r = await one('SELECT selfie FROM attendance WHERE session_id=$1 AND student_id=$2', [s.id, +req.params.student]);
+  if (!r || !r.selfie) return res.status(404).json({ error: 'No selfie' });
+  res.type('image/jpeg').set('Cache-Control', 'private, max-age=3600').send(r.selfie);
 }));
 app.post('/api/sessions/:id/override', auth('teacher', 'principal'), h(async (req, res) => { // cross-check against the class photo
   const s = await getSession(req, res); if (!s) return;
@@ -218,22 +257,47 @@ app.get('/api/sessions/active', auth('student'), h(async (req, res) => {
   res.json({ session: s || null, already_marked: !!done });
 }));
 app.post('/api/attendance/mark', auth('student'), h(async (req, res) => {
-  const { session_id, lat, lon, accuracy } = req.body;
+  const { session_id, lat, lon, accuracy, selfie } = req.body;
   if (!validGps(req.body)) return res.status(400).json({ error: 'Location is required' });
+  const hasSelfie = /^data:image\/jpeg;base64,/.test(selfie || '');
+  if (process.env.REQUIRE_SELFIE !== 'false' && !hasSelfie) return res.status(400).json({ error: 'Take a selfie to mark attendance' });
+  const selfieImg = hasSelfie ? Buffer.from(selfie.split(',')[1], 'base64') : null;
+  if (selfieImg && selfieImg.length > 1.5e6) return res.status(400).json({ error: 'Selfie is too large' });
   const s = await one("SELECT * FROM sessions WHERE id=$1 AND status='open' AND expires_at>$2 AND class_id=$3", [+session_id || 0, Date.now(), req.user.class_id]);
   if (!s) return res.status(400).json({ error: 'No open session for your class' });
   if (accuracy > MAX_ACCURACY) return res.status(400).json({ error: `GPS is weak (±${Math.round(accuracy)} m). Try again` });
   const d = distanceM(s.lat, s.lon, lat, lon);
   if (d > RADIUS_M) return res.status(403).json({ error: `You are ${Math.round(d)} m from the teacher. Move within ${RADIUS_M} m` });
   try {
-    await q('INSERT INTO attendance(session_id,student_id,lat,lon,accuracy,distance_m,marked_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [s.id, req.user.id, lat, lon, accuracy, d, Date.now()]);
+    await q('INSERT INTO attendance(session_id,student_id,lat,lon,accuracy,distance_m,marked_at,selfie) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [s.id, req.user.id, lat, lon, accuracy, d, Date.now(), selfieImg]);
   } catch (e) { if (!dup(e)) throw e; return res.status(409).json({ error: 'Attendance already marked' }); }
   res.json({ ok: true, distance_m: Math.round(d) });
 }));
 app.get('/api/student/stats', auth('student'), h(async (req, res) => res.json(await q(
   `SELECT s.subject, COUNT(*) AS total, COUNT(a.id) AS present FROM sessions s
    LEFT JOIN attendance a ON a.session_id=s.id AND a.student_id=$1 WHERE s.class_id=$2 GROUP BY s.subject ORDER BY s.subject`, [req.user.id, req.user.class_id]))));
+
+// ---------- Leave requests ----------
+app.post('/api/leaves', auth('student'), h(async (req, res) => {
+  const { from_date, to_date, reason } = req.body;
+  if (!isDate(from_date) || !isDate(to_date) || from_date > to_date || !(reason || '').trim())
+    return res.status(400).json({ error: 'Enter valid dates (from before to) and a reason' });
+  await q('INSERT INTO leaves(student_id,from_date,to_date,reason,created_at) VALUES ($1,$2,$3,$4,$5)', [req.user.id, from_date, to_date, reason.trim().slice(0, 300), Date.now()]);
+  res.json({ ok: true });
+}));
+app.get('/api/leaves', auth(), h(async (req, res) => {
+  const where = { student: 'WHERE l.student_id=$1', teacher: 'WHERE u.class_id IN (SELECT class_id FROM teacher_classes WHERE teacher_id=$1)', principal: 'WHERE $1 > 0' }[req.user.role];
+  res.json(await q(`SELECT l.id,l.from_date,l.to_date,l.reason,l.status,u.name AS student,c.name AS class FROM leaves l
+    JOIN users u ON u.id=l.student_id LEFT JOIN classes c ON c.id=u.class_id ${where} ORDER BY l.id DESC LIMIT 50`, [req.user.id]));
+}));
+app.post('/api/leaves/:id/decision', auth('teacher', 'principal'), h(async (req, res) => {
+  const l = await one(`SELECT l.id FROM leaves l JOIN users u ON u.id=l.student_id WHERE l.id=$1
+    AND ($2 OR u.class_id IN (SELECT class_id FROM teacher_classes WHERE teacher_id=$3))`, [+req.params.id, req.user.role === 'principal', req.user.id]);
+  if (!l) return res.status(404).json({ error: 'Leave request not found' });
+  await q('UPDATE leaves SET status=$1 WHERE id=$2', [req.body.approve ? 'approved' : 'rejected', l.id]);
+  res.json({ ok: true });
+}));
 
 app.use((err, req, res, next) => {
   if (err.status === 413) return res.status(413).json({ error: 'Photo is too large' });
