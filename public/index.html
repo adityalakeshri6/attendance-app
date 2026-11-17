@@ -62,9 +62,9 @@ const getPos = () => new Promise((ok, fail) => navigator.geolocation
       () => fail(new Error('Allow location access to continue')), { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 })
   : fail(new Error('This browser has no location support')));
 const msg = (el, text, ok) => { el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'err'); };
-const resize = file => new Promise((ok, fail) => {
+const resize = (file, max = 1024) => new Promise((ok, fail) => {
   const img = new Image(); img.onerror = () => fail(new Error('Could not read that photo'));
-  img.onload = () => { const k = Math.min(1, 1024 / Math.max(img.width, img.height)), c = document.createElement('canvas');
+  img.onload = () => { const k = Math.min(1, max / Math.max(img.width, img.height)), c = document.createElement('canvas');
     c.width = img.width * k; c.height = img.height * k; c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); ok(c.toDataURL('image/jpeg', .7)); };
   img.src = URL.createObjectURL(file);
 });
@@ -94,12 +94,30 @@ async function sessionPanel(el, id, editable) {
   const refresh = async () => {
     const d = await api(`/sessions/${id}/attendance`), n = d.students.filter(s => s.marked_at).length;
     el.querySelector('.list').innerHTML = `<p><strong>${esc(d.session.subject)}</strong>: ${n} of ${d.students.length} present</p><table>` + d.students.map(s => `
-      <tr><td>${esc(s.name)}</td><td class="${s.marked_at ? 'ok' : 'muted'}">${s.marked_at ? (s.method === 'manual' ? 'Present (by teacher)' : 'Present (' + Math.round(s.distance_m) + ' m)') : 'Absent'}</td>
+      <tr><td>${esc(s.name)}</td><td class="${s.marked_at ? 'ok' : 'muted'}">${s.marked_at ? (s.method === 'manual' ? 'Present (by teacher)' : 'Present (' + Math.round(s.distance_m) + ' m)') : (s.on_leave ? 'Absent (approved leave)' : 'Absent')}${s.has_selfie ? ` <button class="ghost" data-sf="${s.id}">Selfie</button>` : ''}</td>
       ${editable ? `<td><button class="ghost" data-s="${s.id}" data-p="${s.marked_at ? 0 : 1}">${s.marked_at ? 'Mark absent' : 'Mark present'}</button></td>` : ''}</tr>`).join('') + '</table>';
   };
-  el.onclick = async e => { const b = e.target.closest('button[data-s]'); if (!b) return;
+  el.onclick = async e => {
+    const f = e.target.closest('button[data-sf]');
+    if (f) { const blob = await api(`/sessions/${id}/selfie/${f.dataset.sf}`, null, true), o = document.createElement('div');
+      o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center;z-index:9';
+      o.innerHTML = `<img src="${URL.createObjectURL(blob)}" alt="Student selfie" style="max-width:90%;max-height:90%;border-radius:8px">`;
+      o.onclick = () => o.remove(); document.body.appendChild(o); return; }
+    const b = e.target.closest('button[data-s]'); if (!b) return;
     await api(`/sessions/${id}/override`, { student_id: +b.dataset.s, present: b.dataset.p === '1' }); refresh(); };
   await refresh(); return refresh;
+}
+
+async function leavesPanel(el, canDecide) {
+  const render = async () => { const list = await api('/leaves');
+    el.innerHTML = list.length ? '<table>' + list.map(l => `<tr><td>${esc(l.student)}<br><span class="muted">${esc(l.class || '')}</span></td>
+      <td>${esc(l.from_date)} to ${esc(l.to_date)}<br><span class="muted">${esc(l.reason)}</span></td>
+      <td class="${l.status === 'approved' ? 'ok' : l.status === 'rejected' ? 'err' : 'muted'}">${l.status}${canDecide && l.status === 'pending' ?
+        `<br><button class="ghost" data-l="${l.id}" data-a="1">Approve</button> <button class="ghost" data-l="${l.id}" data-a="0">Reject</button>` : ''}</td></tr>`).join('') + '</table>'
+      : '<span class="muted">No leave requests.</span>'; };
+  el.onclick = async e => { const b = e.target.closest('button[data-l]'); if (!b) return;
+    await api(`/leaves/${b.dataset.l}/decision`, { approve: b.dataset.a === '1' }); render(); };
+  render();
 }
 
 // ---------- Teacher ----------
@@ -115,8 +133,10 @@ async function teacher() {
       <img id="prev" class="photo hidden" alt="Class photo preview" style="margin-top:10px">
       <button id="startBtn">Start attendance</button><div id="stMsg" class="msg"></div>
     </div>
-    <div class="card hidden" id="liveCard"><div id="panel"></div><button id="closeBtn">Close session</button></div>`;
-  if (!classes.length) msg($('stMsg'), 'No classes yet. Ask the principal to add one.');
+    <div class="card hidden" id="liveCard"><div id="panel"></div><button id="closeBtn">Close session</button></div>
+    <h2>Leave requests</h2><div class="card" id="lv"></div>`;
+  if (!classes.length) msg($('stMsg'), 'No class is assigned to you yet. Ask the principal to assign one.');
+  leavesPanel($('lv'), true);
   $('checkin').onclick = async () => {
     try { await api('/teacher/checkin', await getPos()); msg($('ciMsg'), 'Your attendance is marked for today', true); } catch (e) { msg($('ciMsg'), e.message); }
   };
@@ -140,8 +160,11 @@ async function teacher() {
 // ---------- Student ----------
 function student() {
   $('view').innerHTML = `<div class="card"><div id="status" class="muted">Checking for an open session...</div>
+    <div id="sfWrap" class="hidden"><label for="sf">Selfie (required)</label><input id="sf" type="file" accept="image/*" capture="user"></div>
     <button id="markBtn" class="hidden">Mark my attendance</button><div id="mkMsg" class="msg"></div></div>
-    <h2>My attendance</h2><div class="card" id="stats"></div>`;
+    <h2>My attendance</h2><div class="card" id="stats"></div>
+    <h2>Apply for leave</h2><div class="card"><label for="lf">From</label><input id="lf" type="date"><label for="lt">To</label><input id="lt" type="date">
+      <label for="lr">Reason</label><input id="lr"><button id="lsend">Send request</button><div id="lmsg" class="msg"></div><div id="lv" style="margin-top:12px"></div></div>`;
   let sid = null;
   const stats = async () => { const s = await api('/student/stats');
     $('stats').innerHTML = s.length ? '<table>' + s.map(x => { const p = Math.round(100 * x.present / x.total);
@@ -150,12 +173,16 @@ function student() {
     const d = await api('/sessions/active'); sid = d.session && d.session.id;
     $('status').textContent = !d.session ? 'No open session for your class right now.'
       : d.already_marked ? `Attendance marked for ${d.session.subject}.` : `${d.session.subject} is open. Stay within the class area and tap below.`;
-    $('markBtn').classList.toggle('hidden', !d.session || d.already_marked);
+    $('markBtn').classList.toggle('hidden', !d.session || d.already_marked); $('sfWrap').classList.toggle('hidden', !d.session || d.already_marked);
   };
   poll(); stats(); timer = setInterval(poll, 5000);
+  leavesPanel($('lv'), false);
+  $('lsend').onclick = async () => { try { await api('/leaves', { from_date: $('lf').value, to_date: $('lt').value, reason: $('lr').value });
+    msg($('lmsg'), 'Leave request sent', true); leavesPanel($('lv'), false); } catch (e) { msg($('lmsg'), e.message); } };
   $('markBtn').onclick = async () => {
     try { msg($('mkMsg'), 'Getting your location...', true);
-      const r = await api('/attendance/mark', { ...(await getPos()), session_id: sid });
+      const f = $('sf').files[0]; if (!f) throw new Error('Take a selfie first');
+      const r = await api('/attendance/mark', { ...(await getPos()), selfie: await resize(f, 480), session_id: sid });
       msg($('mkMsg'), `Marked present (${r.distance_m} m from teacher)`, true); poll(); stats();
     } catch (e) { msg($('mkMsg'), e.message); }
   };
@@ -163,8 +190,8 @@ function student() {
 
 // ---------- Principal ----------
 function principal() {
-  $('view').innerHTML = `<div class="tabs"><button class="tab" data-t="overview">Overview</button><button class="tab" data-t="sessions">Sessions</button><button class="tab" data-t="users">Users</button></div><div id="tab"></div>`;
-  const tabs = { overview, sessions, users };
+  $('view').innerHTML = `<div class="tabs"><button class="tab" data-t="overview">Overview</button><button class="tab" data-t="sessions">Sessions</button><button class="tab" data-t="defaulters">Defaulters</button><button class="tab" data-t="leaves">Leaves</button><button class="tab" data-t="users">Users</button></div><div id="tab"></div>`;
+  const tabs = { overview, sessions, defaulters, leaves, users };
   document.querySelector('.tabs').onclick = e => { const t = e.target.dataset.t; if (!t) return;
     clearInterval(timer); document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t)); tabs[t](); };
   document.querySelector('.tab').click();
@@ -185,22 +212,41 @@ async function sessions() {
   $('tab').onclick = async e => { const b = e.target.closest('button[data-id]'); if (!b) return;
     $('detail').classList.remove('hidden'); await sessionPanel($('detail'), +b.dataset.id, true); $('detail').scrollIntoView(); };
 }
+async function defaulters() {
+  $('tab').innerHTML = `<div class="card"><label for="mn">Show students below (%)</label><input id="mn" type="number" value="75" min="1" max="100"><button id="go">Show</button></div><div class="card" id="dl"></div>`;
+  const load = async () => { const list = await api('/principal/defaulters?min=' + (+$('mn').value || 75));
+    $('dl').innerHTML = list.length ? '<table>' + list.map(s => { const p = Math.round(100 * s.present / s.total), ph = s.parent_phone ? (s.parent_phone.length === 10 ? '91' + s.parent_phone : s.parent_phone) : '';
+      const text = encodeURIComponent(`Dear parent, ${s.name}'s attendance is ${p}% (${s.present} of ${s.total} lectures). Please make sure they attend regularly.`);
+      return `<tr><td>${esc(s.name)}<br><span class="muted">${esc(s.class)}</span></td><td class="err">${p}%</td>
+        <td>${ph ? `<a href="https://wa.me/${ph}?text=${text}" target="_blank" rel="noopener">Message parent</a>` : '<span class="muted">No phone</span>'}</td></tr>`; }).join('') + '</table>'
+      : '<span class="muted">No students below this level.</span>'; };
+  $('go').onclick = load; load();
+}
+function leaves() { $('tab').innerHTML = '<div class="card" id="lv"></div>'; leavesPanel($('lv'), true); }
 async function users() {
-  const [classes, list] = await Promise.all([api('/classes'), api('/users')]);
+  const [classes, list, asg] = await Promise.all([api('/classes'), api('/users'), api('/assignments')]);
+  const clsOpts = classes.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
   $('tab').innerHTML = `
     <div class="card"><strong>Add a class</strong><label for="cn">Class name</label><input id="cn" placeholder="e.g. BSc.CA TY"><button id="addClass">Add class</button><div id="cMsg" class="msg"></div></div>
     <div class="card"><strong>Add a user</strong>
       <label for="un">Name</label><input id="un"><label for="ue">Email</label><input id="ue" type="email"><label for="up">Password (6+ characters)</label><input id="up">
+      <label for="upp">Parent phone (students, optional)</label><input id="upp" type="tel">
       <label for="ur">Role</label><select id="ur"><option value="student">Student</option><option value="teacher">Teacher</option><option value="principal">Principal</option></select>
       <div id="clsWrap"><label for="uc">Class (for students)</label><select id="uc">${classes.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
       <button id="addUser">Add user</button><div id="uMsg" class="msg"></div></div>
+    <div class="card"><strong>Assign a class to a teacher</strong>
+      <label for="at">Teacher</label><select id="at">${list.filter(u => u.role === 'teacher').map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select>
+      <label for="ac">Class</label><select id="ac">${clsOpts}</select><button id="assign">Assign</button><div id="aMsg" class="msg"></div>
+      <table id="alist">${asg.map(a => `<tr><td>${esc(a.teacher)}</td><td>${esc(a.class)}</td><td><button class="ghost" data-ut="${a.teacher_id}" data-uc="${a.class_id}">Remove</button></td></tr>`).join('')}</table></div>
     <div class="card"><strong>Add many users at once</strong>
       <label for="br">Who</label><select id="br"><option value="student">Students</option><option value="teacher">Teachers</option></select>
       <label for="bc">Class (for students)</label><select id="bc">${classes.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select>
-      <label for="bt">One per line: name, email, password (password is optional)</label><textarea id="bt" rows="5" placeholder="Riya Shah, riya@mail.com"></textarea>
+      <label for="bt">One per line: name, email, parent phone (phone is for students, optional). Passwords are created for you.</label><textarea id="bt" rows="5" placeholder="Riya Shah, riya@mail.com"></textarea>
       <button id="bulk">Add all</button><div id="bMsg" class="msg"></div><pre id="bOut" style="white-space:pre-wrap"></pre></div>
     <div class="card" id="ulist"><table>${list.map(u => `<tr><td>${esc(u.name)}<br><span class="muted">${esc(u.email)}</span></td><td>${esc(u.role)}${u.class ? '<br><span class="muted">' + esc(u.class) + '</span>' : ''}</td>
       <td><button class="ghost" data-r="${u.id}">Reset password</button></td></tr>`).join('')}</table></div>`;
+  $('assign').onclick = async () => { try { await api('/assignments', { teacher_id: +$('at').value, class_id: +$('ac').value }); users(); } catch (e) { msg($('aMsg'), e.message); } };
+  $('alist').onclick = async e => { const b = e.target.closest('button[data-ut]'); if (!b) return; await api('/assignments/remove', { teacher_id: +b.dataset.ut, class_id: +b.dataset.uc }); users(); };
   $('ulist').onclick = async e => { const b = e.target.closest('button[data-r]'); if (!b) return; const pw = prompt('New password for this user (6+ characters)'); if (!pw) return;
     try { await api(`/users/${b.dataset.r}/password`, { password: pw }); alert('Password changed'); } catch (err) { alert(err.message); } };
   $('bulk').onclick = async () => { try {
@@ -211,7 +257,7 @@ async function users() {
   $('ur').onchange = () => $('clsWrap').classList.toggle('hidden', $('ur').value !== 'student');
   $('addClass').onclick = async () => { try { await api('/classes', { name: $('cn').value }); users(); } catch (e) { msg($('cMsg'), e.message); } };
   $('addUser').onclick = async () => { try {
-    await api('/users', { name: $('un').value, email: $('ue').value, password: $('up').value, role: $('ur').value, class_id: +$('uc').value }); users();
+    await api('/users', { name: $('un').value, email: $('ue').value, password: $('up').value, parent_phone: $('upp').value, role: $('ur').value, class_id: +$('uc').value }); users();
   } catch (e) { msg($('uMsg'), e.message); } };
 }
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
